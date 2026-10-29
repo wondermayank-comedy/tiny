@@ -1,0 +1,10 @@
+name = "thunderstudy-group-bot"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+MUTE_HOURS = "24"
+
+# Secrets (set with `npx wrangler secret put <NAME>`):
+#   BOT_TOKEN       — token from @BotFather
+#   WEBHOOK_SECRET  — any random string (letters/numbers/_/-)
