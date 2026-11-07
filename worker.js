@@ -1,9 +1,13 @@
 // ThunderStudy Group Bot — Cloudflare Worker (webhook)
-// Auto-replies (cuet / mock / notes / english / contact / ai) + mutes for links & "dm" spam.
+// Auto-replies (cuet / mock / notes / english / contact / ai)
+// + mutes for links & "dm" spam
+// + anti-piracy: blocks requests for paid publisher books & premium lectures
+//   (Oswal, Educart, Arihant, Sunil Panda, SPCC, PW ...) -> delete, 10 min mute, polite public notice.
 
 // ───────────────────────── CONFIG (edit here) ─────────────────────────
 const CONFIG = {
   MUTE_HOURS: 24, // can be overridden with env var MUTE_HOURS
+  PIRACY_MUTE_MINUTES: 10, // can be overridden with env var PIRACY_MUTE_MINUTES
 
   // Websites that are allowed (subdomains are allowed automatically)
   ALLOWED_DOMAINS: [
@@ -21,6 +25,51 @@ const CONFIG = {
 
   // Words / phrases that cause a mute
   BANNED_WORDS: ['dm', 'dms', 'd.m', 'dm me', 'pm me', 'inbox me', 'whatsapp me', 'ping me in dm'],
+
+  // Paid books / lecture sellers that must NOT be requested here.
+  // `re` runs on a normalised text (lowercase, punctuation -> spaces). Add more freely.
+  PAID_BRANDS: [
+    // publishers
+    { name: 'Oswal', re: /\boswal\b/ },
+    { name: 'Educart', re: /\beducart\b/ },
+    { name: 'Arihant', re: /\barihant\b/ },
+    { name: 'Disha Publication', re: /\bdisha\s*(publications?|books?)?\b/ },
+    { name: 'MTG', re: /\bmtg\b/ },
+    { name: 'Pradeep', re: /\bpradeep(?:\s*(publications?|books?))\b/ },
+    { name: 'Dhanpat Rai', re: /\bdhanpat\s*rai\b/ },
+    { name: 'Lucent', re: /\blucent\b/ },
+    { name: 'Kiran Prakashan', re: /\bkiran\s*(prakashan|publications?|books?)\b/ },
+    { name: 'Rakesh Yadav', re: /\brakesh\s*yadav\b/ },
+    { name: 'Xam Idea', re: /\bxam\s*idea\b/ },
+    { name: 'Together With', re: /\btogether\s*with\b/ },
+    { name: 'Target Publications', re: /\btarget\s*publications?\b/ },
+    { name: 'S Chand', re: /\bs\s*chand\b/ },
+    // teachers / coaching companies
+    { name: 'Sunil Panda', re: /\bsunil\s*panda\b/ },
+    { name: 'SPCC', re: /\bs\s*p\s*c\s*c\b/ },
+    { name: 'PW (Physics Wallah)', re: /\b(pw|physics\s*wallah|physicswallah|pw\s*skills)\b/ },
+    { name: 'Unacademy', re: /\bunacademy\b/ },
+    { name: 'Vedantu', re: /\bvedantu\b/ },
+    { name: 'Allen', re: /\ballen\s*(kota|notes|modules?|batch|study\s*material)\b/ },
+    { name: 'Aakash', re: /\baakash\b/ },
+    { name: "Byju's", re: /\bbyju'?s?\b/ },
+    { name: 'Adda247', re: /\badda\s*247\b/ },
+    { name: 'Testbook', re: /\btestbook\b/ },
+    { name: 'Career Will', re: /\bcareer\s*will\b/ },
+    { name: 'Khan Sir / Khan GS', re: /\bkhan\s*(sir|gs)\b/ },
+    { name: 'Oliveboard', re: /\boliveboard\b/ },
+  ],
+
+  // A paid brand + one of these words = a "give me the paid thing" request.
+  // (Plain discussion like "Oswal ka paper hard tha" is not punished.)
+  ASK_WORDS: [
+    'pdf', 'pdfs', 'book', 'books', 'ebook', 'notes', 'module', 'modules', 'material', 'free', 'link', 'links',
+    'download', 'send', 'share', 'provide', 'upload', 'give', 'chahiye', 'chaiye', 'chahie', 'bhejo', 'bhej',
+    'dedo', 'de', 'do', 'milega', 'mil', 'kahan', 'kaha', 'where', 'available', 'lecture', 'lectures', 'batch',
+    'course', 'class', 'classes', 'video', 'videos', 'drive', 'telegram', 'channel', 'crack', 'cracked',
+    'leak', 'leaked', 'torrent', 'full', 'complete', 'latest', 'edition', 'plz', 'pls', 'please', 'sample',
+    'sheet', 'sheets', 'dpp', 'dpps', 'recording', 'recorded',
+  ],
 
   COOLDOWN_MS: 20000, // same auto-reply not repeated in a chat within this time
   MAX_AUTOREPLY_LEN: 120, // only auto-reply to short messages (avoids noise)
@@ -58,8 +107,9 @@ const RULES =
   '📜 <b>Group Rules</b>\n' +
   '1. No promotion — no links or Telegram channels/groups (except official ThunderStudy ones).\n' +
   '2. No "DM me" / "PM me" requests.\n' +
-  '3. Be respectful. Help each other.\n' +
-  '4. Breaking rule 1 or 2 = automatic mute.';
+  '3. Do not ask for paid / copyrighted material — Oswal, Educart, Arihant and other publisher books, or PW, Sunil Panda, SPCC and other paid lectures. We do not provide them here.\n' +
+  '4. Be respectful. Help each other.\n' +
+  '5. Breaking rule 1 or 2 = automatic mute. Breaking rule 3 = 10 minute mute and a public notice.';
 
 const COMMANDS = {
   start: HELP, help: HELP, rules: RULES,
@@ -99,6 +149,20 @@ const BAD_RE = new RegExp(
 // http(s)://…, www.…, t.me/…, tg://…, bare domain.tld/…
 const URL_RE =
   /(?:https?:\/\/|tg:\/\/|www\.)[^\s]+|\b(?:t\.me|telegram\.me|telegram\.dog)\/[^\s]+|\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.(?:com|in|me|io|org|net|xyz|co|link|app|ly|gl|tk|ml|cc|site|online|shop|store|info|live|club|top|dev|page|run|gg|ai|bio|click|fun|vip)\b(?:\/[^\s]*)?/gi;
+
+// lowercase, punctuation -> spaces, so "S.P.C.C", "sunil_panda", "Oswal!!" all match
+const normForPiracy = (t) =>
+  t.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, ' ').replace(/\s+/g, ' ').trim();
+
+const ASK_RE = new RegExp('(^|\\s)(' + CONFIG.ASK_WORDS.join('|') + ")(?=\\s|$)", 'i');
+
+// returns the matched brand names (array) when this is a request for paid material, else null
+function findPiracy(text) {
+  const n = normForPiracy(text);
+  const hits = CONFIG.PAID_BRANDS.filter((b) => b.re.test(n)).map((b) => b.name);
+  if (!hits.length) return null;
+  return ASK_RE.test(n) ? hits : null;
+}
 
 const TG_HOSTS = ['t.me', 'telegram.me', 'telegram.dog'];
 
@@ -207,6 +271,43 @@ async function punish(env, msg, reason) {
   });
 }
 
+function mentionOf(user) {
+  const label = esc(user.first_name || 'Friend');
+  return `<a href="tg://user?id=${user.id}">${label}</a>` + (user.username ? ` (@${esc(user.username)})` : '');
+}
+
+async function punishPiracy(env, msg, brands) {
+  const chatId = msg.chat.id;
+  const user = msg.from;
+  const mins = Number(env.PIRACY_MUTE_MINUTES) || CONFIG.PIRACY_MUTE_MINUTES;
+
+  await tg(env, 'deleteMessage', { chat_id: chatId, message_id: msg.message_id });
+  const r = await tg(env, 'restrictChatMember', {
+    chat_id: chatId,
+    user_id: user.id,
+    permissions: NO_PERMS,
+    use_independent_chat_permissions: true,
+    until_date: Math.floor(Date.now() / 1000) + mins * 60,
+  });
+  if (!r.ok) return; // e.g. target is admin / bot lacks rights
+
+  await tg(env, 'sendMessage', {
+    chat_id: chatId,
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    text:
+      `🚫 <b>Request not allowed</b>\n\n` +
+      `Hey ${mentionOf(user)}, you asked for <b>${esc(brands.join(', '))}</b> material.\n\n` +
+      `Paid books, publisher PDFs and premium lectures are the hard work of authors, teachers and publishers — ` +
+      `<b>we do not provide, share or discuss them in this group</b>, and requests for them are not allowed.\n\n` +
+      `✅ <b>What you can get here, 100% free:</b>\n` +
+      `🎯 Mock tests — thundertest.indevs.in\n` +
+      `📚 Notes &amp; study material — thunderstudy.indevs.in\n` +
+      `🤖 Doubt solver — ai.thunderstudy.indevs.in\n\n` +
+      `🔇 You are muted for <b>${mins} minutes</b> to read /rules. Please don't ask again — thank you for understanding 💙`,
+  });
+}
+
 async function reply(env, msg, text) {
   return tg(env, 'sendMessage', {
     chat_id: msg.chat.id,
@@ -247,8 +348,19 @@ async function handleUpdate(env, update) {
   }
 
   const text = msg.text || msg.caption;
-  if (!text || !msg.from || msg.from.is_bot) return;
+  const fileName = (msg.document && msg.document.file_name) || '';
+  if ((!text && !fileName) || !msg.from || msg.from.is_bot) return;
   if (msg.sender_chat) return; // anonymous admin / linked channel posts
+
+  // 0) anti-piracy (groups only): paid-book / paid-lecture requests, or a shared file named after them
+  if (isGroup) {
+    const brands = findPiracy(text || '') || (fileName && CONFIG.PAID_BRANDS.filter((b) => b.re.test(normForPiracy(fileName))).map((b) => b.name)) || null;
+    if (brands && brands.length && !(await isAdmin(env, msg.chat.id, msg.from.id))) {
+      await punishPiracy(env, msg, brands);
+      return;
+    }
+  }
+  if (!text) return;
   const entities = msg.entities || msg.caption_entities || [];
 
   // 1) moderation (groups only)
